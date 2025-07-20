@@ -1,7 +1,7 @@
-name: Pull Request Validation
+name: CI/CD Pipeline
 
 on:
-  pull_request:
+  push:
     branches: [ main, develop ]
     paths:
       - 'back/**'
@@ -9,9 +9,22 @@ on:
       - '.github/workflows/**'
       - 'docker-compose.yml'
       - 'sonar-project.properties'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'back/**'
+      - 'front/**'
+      - '.github/workflows/**'
+      - 'docker-compose.yml'
+      - 'sonar-project.properties'
+
+env:
+  REGISTRY: docker.io
+  BACKEND_IMAGE_NAME: bobapp-backend
+  FRONTEND_IMAGE_NAME: bobapp-frontend
 
 jobs:
-  # Détection des changements
+  # Job pour détecter les changements
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
@@ -38,9 +51,9 @@ jobs:
           workflows:
             - '.github/workflows/**'
 
-  # Validation des tests backend pour les PR
-  validate-backend:
-    name: Validate Backend
+  # Job pour les tests du backend
+  backend-tests:
+    name: Backend Tests
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.workflows == 'true'
@@ -48,6 +61,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Shallow clones should be disabled for better SonarCloud analysis
     
     - name: Set up JDK 11
       uses: actions/setup-java@v4
@@ -67,19 +82,20 @@ jobs:
         cd back
         mvn clean test
     
-    - name: Check test results
+    - name: Generate test report
       run: |
         cd back
-        if [ -d "target/surefire-reports" ]; then
-          echo "✅ Backend tests passed"
-        else
-          echo "❌ Backend tests failed"
-          exit 1
-        fi
+        mvn jacoco:report
+    
+    - name: Upload backend coverage reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: backend-coverage-report
+        path: back/target/site/jacoco/
 
-  # Validation des tests frontend pour les PR
-  validate-frontend:
-    name: Validate Frontend
+  # Job pour les tests du frontend
+  frontend-tests:
+    name: Frontend Tests
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.workflows == 'true'
@@ -95,7 +111,7 @@ jobs:
         cache: 'npm'
         cache-dependency-path: front/package-lock.json
     
-    - name: Install dependencies
+    - name: Install frontend dependencies
       run: |
         cd front
         npm ci
@@ -103,31 +119,39 @@ jobs:
     - name: Run frontend tests
       run: |
         cd front
-        npm run test -- --watch=false --browsers=ChromeHeadless
+        npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
     
-    - name: Build frontend
-      run: |
-        cd front
-        npm run build
+    - name: Upload frontend coverage reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-coverage-report
+        path: front/coverage/
 
-  # Validation de la qualité du code (version allégée pour les PR)
-  code-quality-check:
-    name: Code Quality Check
+  # Job pour l'analyse de qualité avec SonarCloud
+  sonarcloud:
+    name: SonarCloud Analysis
     runs-on: ubuntu-latest
-    needs: [changes, validate-backend, validate-frontend]
-    if: always() && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.workflows == 'true') && (needs.validate-backend.result == 'success' || needs.validate-backend.result == 'skipped') && (needs.validate-frontend.result == 'success' || needs.validate-frontend.result == 'skipped')
+    needs: [changes, backend-tests, frontend-tests]
+    if: always() && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.workflows == 'true') && (needs.backend-tests.result == 'success' || needs.backend-tests.result == 'skipped') && (needs.frontend-tests.result == 'success' || needs.frontend-tests.result == 'skipped')
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 0  # Shallow clones should be disabled for better SonarCloud analysis
     
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
+    
+    - name: Cache SonarCloud packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
     
     - name: Cache Maven dependencies
       uses: actions/cache@v3
@@ -136,32 +160,62 @@ jobs:
         key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
         restore-keys: ${{ runner.os }}-m2
     
+    - name: Set up Node.js for frontend analysis
+      uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+        cache: 'npm'
+        cache-dependency-path: front/package-lock.json
+    
+    - name: Install frontend dependencies
+      run: |
+        cd front
+        npm ci
+    
+    - name: Run frontend tests with coverage
+      if: needs.changes.outputs.frontend == 'true'
+      run: |
+        cd front
+        npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
+    
     - name: Run backend tests with coverage
+      if: needs.changes.outputs.backend == 'true'
       run: |
         cd back
         mvn clean test jacoco:report
     
-    - name: SonarCloud Analysis for PR
+    - name: SonarCloud Scan
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       run: |
         cd back
-        mvn sonar:sonar \
-          -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
+        SONAR_ARGS="-Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
           -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
           -Dsonar.host.url=https://sonarcloud.io \
-          -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
-          -Dsonar.pullrequest.key=${{ github.event.number }} \
-          -Dsonar.pullrequest.branch=${{ github.head_ref }} \
-          -Dsonar.pullrequest.base=${{ github.base_ref }}
+          -Dsonar.login=${{ secrets.SONAR_TOKEN }}"
+        
+        if [[ "${{ needs.changes.outputs.backend }}" == "true" ]]; then
+          SONAR_ARGS="$SONAR_ARGS \
+            -Dsonar.sources=src/main \
+            -Dsonar.tests=src/test \
+            -Dsonar.java.coveragePlugin=jacoco \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml"
+        fi
+        
+        if [[ "${{ needs.changes.outputs.frontend }}" == "true" ]]; then
+          SONAR_ARGS="$SONAR_ARGS \
+            -Dsonar.javascript.lcov.reportPaths=../front/coverage/lcov.info"
+        fi
+        
+        mvn sonar:sonar $SONAR_ARGS
 
-  # Vérification que la construction Docker fonctionne
-  docker-build-test:
-    name: Docker Build Test
+  # Job pour le build et le déploiement
+  build-and-deploy:
+    name: Build and Deploy
     runs-on: ubuntu-latest
-    needs: [changes, validate-backend, validate-frontend]
-    if: (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true') && (needs.validate-backend.result == 'success' || needs.validate-backend.result == 'skipped') && (needs.validate-frontend.result == 'success' || needs.validate-frontend.result == 'skipped')
+    needs: [changes, backend-tests, frontend-tests, sonarcloud]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true')
     
     steps:
     - name: Checkout code
@@ -170,43 +224,74 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     
-    - name: Test backend Docker build
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    
+    - name: Extract metadata for backend
       if: needs.changes.outputs.backend == 'true'
-      run: |
-        cd back
-        docker build -t bobapp-backend-test .
+      id: meta-backend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.BACKEND_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
     
-    - name: Test frontend Docker build
+    - name: Extract metadata for frontend
       if: needs.changes.outputs.frontend == 'true'
-      run: |
-        cd front
-        docker build -t bobapp-frontend-test .
+      id: meta-frontend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.FRONTEND_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
     
-    - name: Verify images
-      run: |
-        docker images | grep bobapp || echo "No bobapp images found"
-        echo "✅ Docker images built successfully"
+    - name: Build and push backend image
+      if: needs.changes.outputs.backend == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: ./back
+        push: true
+        tags: ${{ steps.meta-backend.outputs.tags }}
+        labels: ${{ steps.meta-backend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Build and push frontend image
+      if: needs.changes.outputs.frontend == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: ./front
+        push: true
+        tags: ${{ steps.meta-frontend.outputs.tags }}
+        labels: ${{ steps.meta-frontend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
 
-  # Résumé de la validation de la PR
-  pr-summary:
-    name: PR Validation Summary
+  # Job pour les notifications de succès/échec
+  notify:
+    name: Notification
     runs-on: ubuntu-latest
-    needs: [validate-backend, validate-frontend, code-quality-check, docker-build-test]
+    needs: [build-and-deploy]
     if: always()
     
     steps:
-    - name: Check all jobs status
+    - name: Notify success
+      if: needs.build-and-deploy.result == 'success'
       run: |
-        if [[ "${{ needs.validate-backend.result }}" == "success" && 
-              "${{ needs.validate-frontend.result }}" == "success" && 
-              "${{ needs.code-quality-check.result }}" == "success" && 
-              "${{ needs.docker-build-test.result }}" == "success" ]]; then
-          echo "✅ All validation checks passed! PR is ready for review."
-        else
-          echo "❌ Some validation checks failed. Please fix the issues before merging."
-          echo "Backend tests: ${{ needs.validate-backend.result }}"
-          echo "Frontend tests: ${{ needs.validate-frontend.result }}"
-          echo "Code quality: ${{ needs.code-quality-check.result }}"
-          echo "Docker build: ${{ needs.docker-build-test.result }}"
-          exit 1
-        fi
+        echo "✅ Pipeline CI/CD completed successfully!"
+        echo "🐳 Docker images have been pushed to Docker Hub"
+    
+    - name: Notify failure
+      if: needs.build-and-deploy.result == 'failure'
+      run: |
+        echo "❌ Pipeline CI/CD failed!"
+        exit 1
